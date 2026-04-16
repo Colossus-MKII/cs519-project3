@@ -113,7 +113,6 @@ void mm_extent_insert_phys(struct mm_struct *mm, phys_addr_t phys)
 			prev = cur;
 			link = &(*link)->rb_right;
 		} else {
-			/* phys already covered by an existing extent */
 			spin_unlock(&mm->extent_lock);
 			goto out_free;
 		}
@@ -149,14 +148,7 @@ void mm_extent_insert_phys(struct mm_struct *mm, phys_addr_t phys)
 		return;
 	}
 
-	if (merge_next) {
-		list_add(&page_node->list, &next->page_list);
-		next->start_phys = phys;
-		next->nr_pages++;
-		spin_unlock(&mm->extent_lock);
-		kfree(new_extent);
-		return;
-	}
+	/* merge_next-only case: fall through and create a new extent */
 
 	new_extent->extent_id = ++mm->extent_id_gen;
 	new_extent->start_phys = phys;

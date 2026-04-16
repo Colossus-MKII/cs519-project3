@@ -1,0 +1,22 @@
+  CALL    scripts/checksyscalls.sh
+  CALL    scripts/atomic/check-atomics.sh
+  DESCEND objtool
+  CHK     include/generated/compile.h
+  CHK     kernel/kheaders_data.tar.xz
+  CC [M]  fs/f2fs/dir.o
+In file included from fs/f2fs/dir.c:13:
+fs/f2fs/f2fs.h:596:8: error: redefinition of ‘struct extent_node’
+  596 | struct extent_node {
+      |        ^~~~~~~~~~~
+In file included from ./include/linux/mmzone.h:21,
+                 from ./include/linux/gfp.h:6,
+                 from ./include/linux/xarray.h:14,
+                 from ./include/linux/radix-tree.h:19,
+                 from ./include/linux/fs.h:15,
+                 from fs/f2fs/dir.c:9:
+./include/linux/mm_types.h:331:8: note: originally defined here
+  331 | struct extent_node {
+      |        ^~~~~~~~~~~
+make[2]: *** [scripts/Makefile.build:297: fs/f2fs/dir.o] Error 1
+make[1]: *** [scripts/Makefile.build:560: fs/f2fs] Error 2
+make: *** [Makefile:1928: fs] Error 2
