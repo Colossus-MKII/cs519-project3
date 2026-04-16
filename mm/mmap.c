@@ -81,127 +81,6 @@ static void unmap_region(struct mm_struct *mm, struct vm_area_struct *vma,
 			 struct vm_area_struct *prev, unsigned long start,
 			 unsigned long end);
 
-/* ===================== CS519 extent helpers ===================== */
-
-void mm_extent_insert_phys(struct mm_struct *mm, phys_addr_t phys)
-{
-	struct rb_node **link = &mm->extent_tree.rb_node;
-	struct rb_node *parent = NULL;
-	struct cs519_extent_node *cur = NULL, *prev = NULL, *next = NULL;
-	struct cs519_extent_page_node *page_node = NULL;
-	struct cs519_extent_node *new_extent = NULL;
-	bool merge_prev = false, merge_next = false;
-
-	page_node = kmalloc(sizeof(*page_node), GFP_KERNEL);
-	new_extent = kmalloc(sizeof(*new_extent), GFP_KERNEL);
-	if (!page_node || !new_extent)
-		goto out_free;
-
-	page_node->phys_addr = phys;
-	INIT_LIST_HEAD(&page_node->list);
-
-	spin_lock(&mm->extent_lock);
-
-	while (*link) {
-		parent = *link;
-		cur = rb_entry(parent, struct cs519_extent_node, rb_node);
-
-		if (phys < cur->start_phys) {
-			next = cur;
-			link = &(*link)->rb_left;
-		} else if (phys >= cur->end_phys) {
-			prev = cur;
-			link = &(*link)->rb_right;
-		} else {
-			spin_unlock(&mm->extent_lock);
-			goto out_free;
-		}
-	}
-
-	merge_prev = prev && (prev->end_phys == phys);
-	merge_next = next && (phys + PAGE_SIZE == next->start_phys);
-
-	if (merge_prev && merge_next) {
-		list_add_tail(&page_node->list, &prev->page_list);
-		prev->end_phys += PAGE_SIZE;
-		prev->nr_pages++;
-
-		list_splice_tail_init(&next->page_list, &prev->page_list);
-		prev->end_phys = next->end_phys;
-		prev->nr_pages += next->nr_pages;
-
-		rb_erase(&next->rb_node, &mm->extent_tree);
-		mm->total_extents--;
-
-		spin_unlock(&mm->extent_lock);
-		kfree(new_extent);
-		kfree(next);
-		return;
-	}
-
-	if (merge_prev) {
-		list_add_tail(&page_node->list, &prev->page_list);
-		prev->end_phys += PAGE_SIZE;
-		prev->nr_pages++;
-		spin_unlock(&mm->extent_lock);
-		kfree(new_extent);
-		return;
-	}
-
-	/* merge_next-only case: fall through and create a new extent */
-
-	new_extent->extent_id = ++mm->extent_id_gen;
-	new_extent->start_phys = phys;
-	new_extent->end_phys = phys + PAGE_SIZE;
-	new_extent->nr_pages = 1;
-	INIT_LIST_HEAD(&new_extent->page_list);
-	list_add(&page_node->list, &new_extent->page_list);
-
-	rb_link_node(&new_extent->rb_node, parent, link);
-	rb_insert_color(&new_extent->rb_node, &mm->extent_tree);
-	mm->total_extents++;
-
-	spin_unlock(&mm->extent_lock);
-	return;
-
-out_free:
-	kfree(page_node);
-	kfree(new_extent);
-}
-
-void mm_extent_report_and_destroy(struct mm_struct *mm)
-{
-	struct rb_root old_tree;
-	struct rb_node *node;
-	unsigned long count;
-
-	spin_lock(&mm->extent_lock);
-	count = mm->total_extents;
-	old_tree = mm->extent_tree;
-	mm->extent_tree = RB_ROOT;
-	mm->total_extents = 0;
-	mm->extent_id_gen = 0;
-	spin_unlock(&mm->extent_lock);
-
-	pr_info("[CS519-HW2] mm=%px total_extents=%lu\n", mm, count);
-
-	for (node = rb_first(&old_tree); node;) {
-		struct cs519_extent_node *ext =
-			rb_entry(node, struct cs519_extent_node, rb_node);
-		struct cs519_extent_page_node *pg, *tmp;
-
-		node = rb_next(node);
-		rb_erase(&ext->rb_node, &old_tree);
-
-		list_for_each_entry_safe (pg, tmp, &ext->page_list, list) {
-			list_del(&pg->list);
-			kfree(pg);
-		}
-		kfree(ext);
-	}
-}
-
-/* =============================================================== */
 /* description of effects of mapping type and prot in current implementation.
  * this is due to the limited x86 page protection hardware.  The expected
  * behavior is in parens:
@@ -3323,51 +3202,98 @@ int vm_brk(unsigned long addr, unsigned long len)
 EXPORT_SYMBOL(vm_brk);
 
 /* Release all mmaps. */
-
 void exit_mmap(struct mm_struct *mm)
 {
 	struct mmu_gather tlb;
 	struct vm_area_struct *vma;
 	unsigned long nr_accounted = 0;
 
-	// struct rb_node *node;
-	// struct cs519_extent_node *ext;
-	// struct cs519_extent_page_node *pg_node, *tmp_pg;
+	/* --- CS519 HW2: Print Total Extents and Cleanup Memory --- */
+	if (mm->cs519_extent_count > 0) {
+		struct cs519_extent_node *extent, *next_extent;
+		struct cs519_extent_page_node *pnode, *tmp_pnode;
+		unsigned long flags;
 
+		printk(KERN_INFO
+		       "CS519 HW2: Total Extents for process %s (PID: %d) = %u\n",
+		       current->comm, current->pid, mm->cs519_extent_count);
+
+		spin_lock_irqsave(&mm->cs519_extents_lock, flags);
+
+		rbtree_postorder_for_each_entry_safe (
+			extent, next_extent, &mm->cs519_extents_root, rb) {
+			list_for_each_entry_safe (pnode, tmp_pnode,
+						  &extent->pages_list, list) {
+				list_del(&pnode->list);
+				kfree(pnode);
+			}
+
+			kfree(extent);
+		}
+
+		mm->cs519_extents_root = RB_ROOT;
+		mm->cs519_extent_count = 0;
+
+		spin_unlock_irqrestore(&mm->cs519_extents_lock, flags);
+	}
+	/* --------------------------------------------------------- */
+
+	/* mm's last user has gone, and its about to be pulled down */
 	mmu_notifier_release(mm);
 
-	if (unlikely(mm_is_oom_victim(mm)))
-		set_bit(MMF_OOM_SKIP, &mm->flags);
+	if (unlikely(mm_is_oom_victim(mm))) {
+		/*
+		 * Manually reap the mm to free as much memory as possible.
+		 * Then, as the oom reaper does, set MMF_OOM_SKIP to disregard
+		 * this mm from further consideration.  Taking mm->mmap_lock for
+		 * write after setting MMF_OOM_SKIP will guarantee that the oom
+		 * reaper will not run on this mm again after mmap_lock is
+		 * dropped.
+		 *
+		 * Nothing can be holding mm->mmap_lock here and the above call
+		 * to mmu_notifier_release(mm) ensures mmu notifier callbacks in
+		 * __oom_reap_task_mm() will not block.
+		 *
+		 * This needs to be done before calling munlock_vma_pages_all(),
+		 * which clears VM_LOCKED, otherwise the oom reaper cannot
+		 * reliably test it.
+		 */
+		(void)__oom_reap_task_mm(mm);
 
-	mmap_write_lock(mm);
+		set_bit(MMF_OOM_SKIP, &mm->flags);
+		mmap_write_lock(mm);
+		mmap_write_unlock(mm);
+	}
+
+	if (mm->locked_vm)
+		unlock_range(mm->mmap, ULONG_MAX);
+
 	arch_exit_mmap(mm);
 
 	vma = mm->mmap;
-	if (!vma) {
-		mmap_write_unlock(mm);
-		goto cleanup_extents;
-	}
+	if (!vma) /* Can happen if dup_mmap() received an OOM */
+		return;
 
 	lru_add_drain();
 	flush_cache_mm(mm);
-	tlb_gather_mmu(&tlb, mm);
-
-	update_hiwater_rss(mm);
-
+	tlb_gather_mmu_fullmm(&tlb, mm);
+	/* update_hiwater_rss(mm) here? but nobody should be looking */
+	/* Use -1 here to ensure all VMAs in the mm are unmapped */
 	unmap_vmas(&tlb, vma, 0, -1);
-	mmap_write_unlock(mm);
-
+	free_pgtables(&tlb, vma, FIRST_USER_ADDRESS, USER_PGTABLES_CEILING);
 	tlb_finish_mmu(&tlb);
 
+	/*
+	 * Walk the list again, actually closing and freeing it,
+	 * with preemption enabled, without holding any MM locks.
+	 */
 	while (vma) {
+		if (vma->vm_flags & VM_ACCOUNT)
+			nr_accounted += vma_pages(vma);
 		vma = remove_vma(vma);
 		cond_resched();
 	}
-
-cleanup_extents:
-	mm_extent_report_and_destroy(mm);
-
-	/* ========================================================== */
+	vm_unacct_memory(nr_accounted);
 }
 
 /* Insert vm structure into process list sorted by address

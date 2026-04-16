@@ -38,7 +38,7 @@
  *
  * Aug/Sep 2004 Changed to four level page tables (Andi Kleen)
  */
-#include <linux/slab.h>
+
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
@@ -73,6 +73,7 @@
 #include <linux/perf_event.h>
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
+#include <linux/slab.h>
 
 #include <trace/events/kmem.h>
 
@@ -120,6 +121,75 @@ int randomize_va_space __read_mostly =
 #else
 	2;
 #endif
+
+static void cs519_record_page(struct mm_struct *mm, unsigned long phys_addr)
+{
+	unsigned long flags;
+	struct rb_node *n;
+	struct cs519_extent_node *target_extent = NULL;
+	struct cs519_extent_node *new_extent;
+	struct cs519_extent_page_node *new_page;
+	struct rb_node **link;
+	struct rb_node *parent = NULL;
+
+	new_page = kmalloc(sizeof(*new_page), GFP_ATOMIC);
+	if (!new_page)
+		return;
+	new_page->phys_addr = phys_addr;
+
+	spin_lock_irqsave(&mm->cs519_extents_lock, flags);
+
+	n = mm->cs519_extents_root.rb_node;
+	while (n) {
+		struct cs519_extent_node *this =
+			rb_entry(n, struct cs519_extent_node, rb);
+		if (this->start_phys < phys_addr) {
+			target_extent = this;
+			n = n->rb_right;
+		} else {
+			n = n->rb_left;
+		}
+	}
+
+	if (target_extent && target_extent->end_phys == phys_addr) {
+		list_add_tail(&new_page->list, &target_extent->pages_list);
+		target_extent->end_phys += PAGE_SIZE;
+		target_extent->num_pages++;
+		spin_unlock_irqrestore(&mm->cs519_extents_lock, flags);
+		return;
+	}
+
+	new_extent = kmalloc(sizeof(*new_extent), GFP_ATOMIC);
+	if (!new_extent) {
+		kfree(new_page);
+		spin_unlock_irqrestore(&mm->cs519_extents_lock, flags);
+		return;
+	}
+
+	new_extent->start_phys = phys_addr;
+	new_extent->end_phys = phys_addr + PAGE_SIZE;
+	new_extent->num_pages = 1;
+	new_extent->extent_id = ++mm->cs519_extent_count;
+	INIT_LIST_HEAD(&new_extent->pages_list);
+	list_add_tail(&new_page->list, &new_extent->pages_list);
+
+	link = &mm->cs519_extents_root.rb_node;
+	while (*link) {
+		struct cs519_extent_node *this;
+		parent = *link;
+		this = rb_entry(parent, struct cs519_extent_node, rb);
+
+		if (new_extent->start_phys < this->start_phys)
+			link = &((*link)->rb_left);
+		else
+			link = &((*link)->rb_right);
+	}
+
+	rb_link_node(&new_extent->rb, parent, link);
+	rb_insert_color(&new_extent->rb, &mm->cs519_extents_root);
+
+	spin_unlock_irqrestore(&mm->cs519_extents_lock, flags);
+}
 
 #ifndef arch_faults_on_old_pte
 static inline bool arch_faults_on_old_pte(void)
@@ -3054,8 +3124,6 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 	int page_copied = 0;
 	struct mmu_notifier_range range;
 	int ret;
-	phys_addr_t extent_phys = 0;
-	bool extent_inserted = false;
 
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
@@ -3093,7 +3161,6 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 	cgroup_throttle_swaprate(new_page, GFP_KERNEL);
 
 	__SetPageUptodate(new_page);
-	extent_phys = page_to_phys(new_page);
 
 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, mm,
 				vmf->address & PAGE_MASK,
@@ -3136,7 +3203,6 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		 */
 		set_pte_at_notify(mm, vmf->address, vmf->pte, entry);
 		update_mmu_cache(vma, vmf->address, vmf->pte);
-		extent_inserted = true;
 		if (old_page) {
 			/*
 			 * Only after switching the pte to the new page may
@@ -3174,8 +3240,6 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		put_page(new_page);
 
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
-	if (extent_inserted)
-		mm_extent_insert_phys(mm, extent_phys);
 	/*
 	 * No need to double call mmu_notifier->invalidate_range() callback as
 	 * the above ptep_clear_flush_notify() did already call it.
@@ -3796,7 +3860,6 @@ out_release:
 		put_swap_device(si);
 	return ret;
 }
-/* CS519 Helper */
 
 /*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
@@ -3806,16 +3869,24 @@ out_release:
 static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
-	struct page *page = NULL;
+	struct page *page;
 	vm_fault_t ret = 0;
 	pte_t entry;
-	phys_addr_t extent_phys = 0;
-	bool extent_inserted = false;
 
 	/* File mapping without ->vm_ops ? */
 	if (vma->vm_flags & VM_SHARED)
 		return VM_FAULT_SIGBUS;
 
+	/*
+	 * Use pte_alloc() instead of pte_alloc_map().  We can't run
+	 * pte_offset_map() on pmds where a huge pmd might be created
+	 * from a different thread.
+	 *
+	 * pte_alloc_map() is safe to use under mmap_write_lock(mm) or when
+	 * parallel threads are excluded by other means.
+	 *
+	 * Here we only have mmap_read_lock(mm).
+	 */
 	if (pte_alloc(vma->vm_mm, vmf->pmd))
 		return VM_FAULT_OOM;
 
@@ -3823,37 +3894,31 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	if (unlikely(pmd_trans_unstable(vmf->pmd)))
 		return 0;
 
-	/* Read fault: map shared zero-page, but DO NOT track it as an extent */
+	/* Use the zero-page for reads */
 	if (!(vmf->flags & FAULT_FLAG_WRITE) &&
 	    !mm_forbids_zeropage(vma->vm_mm)) {
 		entry = pte_mkspecial(
 			pfn_pte(my_zero_pfn(vmf->address), vma->vm_page_prot));
-
 		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
 					       vmf->address, &vmf->ptl);
 		if (!pte_none(*vmf->pte)) {
 			update_mmu_tlb(vma, vmf->address, vmf->pte);
-			goto unlock_only;
+			goto unlock;
 		}
-
 		ret = check_stable_address_space(vma->vm_mm);
 		if (ret)
-			goto unlock_only;
-
+			goto unlock;
+		/* Deliver the page fault to userland, check inside PT lock */
 		if (userfaultfd_missing(vma)) {
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 			return handle_userfault(vmf, VM_UFFD_MISSING);
 		}
-
-		set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
-		update_mmu_cache(vma, vmf->address, vmf->pte);
-		goto unlock_only;
+		goto setpte;
 	}
 
-	/* Write fault: allocate a real anonymous page */
+	/* Allocate our own private page. */
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
-
 	page = alloc_zeroed_user_highpage_movable(vma, vmf->address);
 	if (!page)
 		goto oom;
@@ -3862,6 +3927,11 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 		goto oom_free_page;
 	cgroup_throttle_swaprate(page, GFP_KERNEL);
 
+	/*
+	 * The memory barrier inside __SetPageUptodate makes sure that
+	 * preceding stores to the page contents become visible before
+	 * the set_pte_at() write.
+	 */
 	__SetPageUptodate(page);
 
 	entry = mk_pte(page, vma->vm_page_prot);
@@ -3869,19 +3939,18 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	if (vma->vm_flags & VM_WRITE)
 		entry = pte_mkwrite(pte_mkdirty(entry));
 
-	extent_phys = page_to_phys(page);
-
 	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
 				       &vmf->ptl);
 	if (!pte_none(*vmf->pte)) {
 		update_mmu_cache(vma, vmf->address, vmf->pte);
-		goto release_page_unlock;
+		goto release;
 	}
 
 	ret = check_stable_address_space(vma->vm_mm);
 	if (ret)
-		goto release_page_unlock;
+		goto release;
 
+	/* Deliver the page fault to userland, check inside PT lock */
 	if (userfaultfd_missing(vma)) {
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		put_page(page);
@@ -3891,26 +3960,24 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
 	page_add_new_anon_rmap(page, vma, vmf->address, false);
 	lru_cache_add_inactive_or_unevictable(page, vma);
-
+setpte:
 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+
+	/* No need to invalidate - it was non-present before */
 	update_mmu_cache(vma, vmf->address, vmf->pte);
-
-	extent_inserted = true;
-
-unlock_and_maybe_track:
+unlock:
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
-	if (extent_inserted)
-		mm_extent_insert_phys(vma->vm_mm, extent_phys);
-	return ret;
 
-unlock_only:
-	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	/* --- CS519 HW2 Hook: Record Anonymous Page --- */
+	if (page) {
+		unsigned long phys_addr = page_to_phys(page);
+		cs519_record_page(vma->vm_mm, phys_addr);
+	}
+	/* ------------------------------------------- */
 	return ret;
-
-release_page_unlock:
+release:
 	put_page(page);
-	goto unlock_and_maybe_track;
-
+	goto unlock;
 oom_free_page:
 	put_page(page);
 oom:
@@ -4171,6 +4238,13 @@ vm_fault_t finish_fault(struct vm_fault *vmf)
 
 	update_mmu_tlb(vma, vmf->address, vmf->pte);
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+	/* --- CS519 HW2 Hook: Record I/O Cache Page --- */
+	if (vmf->page) {
+		unsigned long phys_addr = page_to_phys(vmf->page);
+		cs519_record_page(vma->vm_mm, phys_addr);
+	}
+	/* ------------------------------------------- */
 	return ret;
 }
 

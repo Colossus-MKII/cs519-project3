@@ -3,7 +3,7 @@
 #define _LINUX_MM_TYPES_H
 
 #include <linux/mm_types_task.h>
-#include <linux/threads.h>
+
 #include <linux/auxvec.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
@@ -15,7 +15,6 @@
 #include <linux/page-flags-layout.h>
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
-#include <linux/types.h>
 
 #include <asm/mmu.h>
 
@@ -319,33 +318,6 @@ struct vm_userfaultfd_ctx {
 struct vm_userfaultfd_ctx {};
 #endif /* CONFIG_USERFAULTFD */
 
-struct cs519_extent_page_node {
-	phys_addr_t phys_addr;
-	struct list_head list;
-};
-
-/* * HW2 Part 1: Extent structure containing a linked list of physically 
- * contiguous pages, number of pages, starting/ending physical address, 
- * and an extent ID.
- */
-struct cs519_extent_node {
-	unsigned long extent_id; /* Incrementing number */
-	phys_addr_t start_phys; /* Starting physical address */
-	phys_addr_t end_phys; /* Exclusive end physical address */
-	unsigned long nr_pages; /* Number of pages in the list */
-
-	struct list_head
-		page_list; /* Head of the linked list for extent_page_node */
-	struct rb_node rb_node; /* Node for the red-black tree in mm_struct */
-};
-
-struct mm_struct;
-
-/*
- * CS519 extent helpers implemented in mm/mmap.c
- */
-void mm_extent_insert_phys(struct mm_struct *mm, phys_addr_t phys);
-void mm_extent_report_and_destroy(struct mm_struct *mm);
 /*
  * This struct describes a virtual memory area. There is one of these
  * per VM-area/task. A VM area is any part of the process virtual memory
@@ -436,11 +408,29 @@ struct core_state {
 };
 
 struct kioctx_table;
+
+struct cs519_extent_page_node {
+	unsigned long phys_addr;
+	struct list_head list;
+};
+
+struct cs519_extent_node {
+	unsigned long start_phys;
+	unsigned long end_phys;
+	unsigned int num_pages;
+	unsigned int extent_id;
+	struct list_head pages_list;
+	struct rb_node rb;
+};
+
 struct mm_struct {
 	struct {
 		struct vm_area_struct *mmap; /* list of VMAs */
 		struct rb_root mm_rb;
 		u64 vmacache_seqnum; /* per-thread vmacache */
+		struct rb_root cs519_extents_root;
+		spinlock_t cs519_extents_lock;
+		unsigned int cs519_extent_count;
 #ifdef CONFIG_MMU
 		unsigned long (*get_unmapped_area)(struct file *filp,
 						   unsigned long addr,
@@ -619,24 +609,6 @@ struct mm_struct {
 #ifdef CONFIG_IOMMU_SUPPORT
 		u32 pasid;
 #endif
-		/* * -----------------------------------------------------------
-         * CS519 HW2: Per-process Extent tracking fields
-         * -----------------------------------------------------------
-         */
-
-		/* Red-black tree index by starting physical address */
-		struct rb_root extent_tree;
-
-		/* Thread-safe requirement: lock for protecting the rb-tree and lists */
-		spinlock_t extent_lock;
-
-		/* Required output: Total number of extents for printing before exit */
-		unsigned long total_extents;
-
-		/* Counter to generate incrementing extent IDs */
-		unsigned long extent_id_gen;
-
-		/* ----------------------------------------------------------- */
 	} __randomize_layout;
 
 	/*
