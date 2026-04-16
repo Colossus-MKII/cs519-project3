@@ -87,9 +87,9 @@ void mm_extent_insert_phys(struct mm_struct *mm, phys_addr_t phys)
 {
 	struct rb_node **link = &mm->extent_tree.rb_node;
 	struct rb_node *parent = NULL;
-	struct extent_node *cur = NULL, *prev = NULL, *next = NULL;
-	struct extent_page_node *page_node = NULL;
-	struct extent_node *new_extent = NULL;
+	struct cs519_extent_node *cur = NULL, *prev = NULL, *next = NULL;
+	struct cs519_extent_page_node *page_node = NULL;
+	struct cs519_extent_node *new_extent = NULL;
 	bool merge_prev = false, merge_next = false;
 
 	page_node = kmalloc(sizeof(*page_node), GFP_KERNEL);
@@ -104,7 +104,7 @@ void mm_extent_insert_phys(struct mm_struct *mm, phys_addr_t phys)
 
 	while (*link) {
 		parent = *link;
-		cur = rb_entry(parent, struct extent_node, rb_node);
+		cur = rb_entry(parent, struct cs519_extent_node, rb_node);
 
 		if (phys < cur->start_phys) {
 			next = cur;
@@ -194,9 +194,9 @@ void mm_extent_report_and_destroy(struct mm_struct *mm)
 	pr_info("[CS519-HW2] mm=%px total_extents=%lu\n", mm, count);
 
 	for (node = rb_first(&old_tree); node;) {
-		struct extent_node *ext =
-			rb_entry(node, struct extent_node, rb_node);
-		struct extent_page_node *pg, *tmp;
+		struct cs519_extent_node *ext =
+			rb_entry(node, struct cs519_extent_node, rb_node);
+		struct cs519_extent_page_node *pg, *tmp;
 
 		node = rb_next(node);
 		rb_erase(&ext->rb_node, &old_tree);
@@ -3339,8 +3339,8 @@ void exit_mmap(struct mm_struct *mm)
 	unsigned long nr_accounted = 0;
 
 	// struct rb_node *node;
-	// struct extent_node *ext;
-	// struct extent_page_node *pg_node, *tmp_pg;
+	// struct cs519_extent_node *ext;
+	// struct cs519_extent_page_node *pg_node, *tmp_pg;
 
 	mmu_notifier_release(mm);
 
@@ -3375,7 +3375,7 @@ void exit_mmap(struct mm_struct *mm)
 cleanup_extents:
 	mm_extent_report_and_destroy(mm);
 
-		/* ========================================================== */
+	/* ========================================================== */
 }
 
 /* Insert vm structure into process list sorted by address

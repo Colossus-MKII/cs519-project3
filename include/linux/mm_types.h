@@ -319,7 +319,7 @@ struct vm_userfaultfd_ctx {
 struct vm_userfaultfd_ctx {};
 #endif /* CONFIG_USERFAULTFD */
 
-struct extent_page_node {
+struct cs519_extent_page_node {
 	phys_addr_t phys_addr;
 	struct list_head list;
 };
@@ -328,7 +328,7 @@ struct extent_page_node {
  * contiguous pages, number of pages, starting/ending physical address, 
  * and an extent ID.
  */
-struct extent_node {
+struct cs519_extent_node {
 	unsigned long extent_id; /* Incrementing number */
 	phys_addr_t start_phys; /* Starting physical address */
 	phys_addr_t end_phys; /* Exclusive end physical address */
