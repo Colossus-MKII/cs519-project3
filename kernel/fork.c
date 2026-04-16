@@ -1059,6 +1059,14 @@ static void mm_init_uprobes_state(struct mm_struct *mm)
 #endif
 }
 
+static inline void mm_init_extents(struct mm_struct *mm)
+{
+	mm->extent_tree = RB_ROOT;
+	spin_lock_init(&mm->extent_lock);
+	mm->total_extents = 0;
+	mm->extent_id_gen = 0;
+}
+
 static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 				 struct user_namespace *user_ns)
 {
@@ -1106,11 +1114,8 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 		goto fail_nocontext;
 
 	mm->user_ns = get_user_ns(user_ns);
-	/* CS519 Project 2: Initialize */
-	mm->extent_tree = RB_ROOT;
-	spin_lock_init(&mm->extent_lock);
-	mm->extent_id_counter = 0;
-	mm->total_extents_created = 0;
+
+	mm_init_extents(mm);
 	return mm;
 
 fail_nocontext:

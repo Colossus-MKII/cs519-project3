@@ -3,9 +3,8 @@
 #define _LINUX_MM_TYPES_H
 
 #include <linux/mm_types_task.h>
-
+#include <linux/threads.h>
 #include <linux/auxvec.h>
-#include <linux/types.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/rbtree.h>
@@ -16,6 +15,7 @@
 #include <linux/page-flags-layout.h>
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
+#include <linux/types.h>
 
 #include <asm/mmu.h>
 
@@ -28,36 +28,6 @@
 
 struct address_space;
 struct mem_cgroup;
-struct kmem_cache;
-
-struct page_pool;
-
-struct anon_vma;
-struct file;
-struct file_ra_state;
-struct linux_binfmt;
-struct mmu_notifier_subscriptions;
-struct mempolicy;
-struct page;
-struct percpu_counter;
-struct pt_regs;
-struct task_struct;
-struct user_namespace;
-struct vm_area_struct;
-struct vm_fault;
-struct vm_operations_struct;
-struct userfaultfd_ctx;
-struct kioctx_table;
-struct rcu_head;
-struct rw_semaphore;
-struct seq_file;
-struct uprobes_state;
-struct vm_region;
-struct vm_special_mapping;
-struct writeback_control;
-struct vm_userfaultfd_ctx;
-struct hstate;
-struct dev_pagemap;
 
 /*
  * Each physical page in the system has a struct page associated with
@@ -99,70 +69,104 @@ struct dev_pagemap;
 #endif
 
 struct page {
-	unsigned long flags;
-
+	unsigned long flags; /* Atomic flags, some possibly
+					 * updated asynchronously */
+	/*
+	 * Five words (20/40 bytes) are available in this union.
+	 * WARNING: bit 0 of the first word is used for PageTail(). That
+	 * means the other users of this union MUST NOT use the bit to
+	 * avoid collision and false-positive PageTail().
+	 */
 	union {
-		struct {
+		struct { /* Page cache and anonymous pages */
+			/**
+			 * @lru: Pageout list, eg. active_list protected by
+			 * lruvec->lru_lock.  Sometimes used as a generic list
+			 * by the page owner.
+			 */
 			struct list_head lru;
+			/* See page-flags.h for PAGE_MAPPING_FLAGS */
 			struct address_space *mapping;
-			pgoff_t index;
+			pgoff_t index; /* Our offset within mapping. */
+			/**
+			 * @private: Mapping-private opaque data.
+			 * Usually used for buffer_heads if PagePrivate.
+			 * Used for swp_entry_t if PageSwapCache.
+			 * Indicates order in the buddy system if PageBuddy.
+			 */
 			unsigned long private;
 		};
-		struct {
+		struct { /* page_pool used by netstack */
+			/**
+			 * @pp_magic: magic value to avoid recycling non
+			 * page_pool allocated pages.
+			 */
 			unsigned long pp_magic;
 			struct page_pool *pp;
 			unsigned long _pp_mapping_pad;
 			unsigned long dma_addr;
 			union {
+				/**
+				 * dma_addr_upper: might require a 64-bit
+				 * value on 32-bit architectures.
+				 */
 				unsigned long dma_addr_upper;
+				/**
+				 * For frag page support, not supported in
+				 * 32-bit architectures with 64-bit DMA.
+				 */
 				atomic_long_t pp_frag_count;
 			};
 		};
-		struct {
+		struct { /* slab, slob and slub */
 			union {
 				struct list_head slab_list;
-				struct {
+				struct { /* Partial pages */
 					struct page *next;
 #ifdef CONFIG_64BIT
-					int pages;
-					int pobjects;
+					int pages; /* Nr of pages left */
+					int pobjects; /* Approximate count */
 #else
 					short int pages;
 					short int pobjects;
 #endif
 				};
 			};
-			struct kmem_cache *slab_cache;
-			void *freelist;
+			struct kmem_cache *slab_cache; /* not slob */
+			/* Double-word boundary */
+			void *freelist; /* first free object */
 			union {
-				void *s_mem;
-				unsigned long counters;
-				struct {
+				void *s_mem; /* slab: first object */
+				unsigned long counters; /* SLUB */
+				struct { /* SLUB */
 					unsigned inuse : 16;
 					unsigned objects : 15;
 					unsigned frozen : 1;
 				};
 			};
 		};
-		struct {
-			unsigned long compound_head;
+		struct { /* Tail pages of compound page */
+			unsigned long compound_head; /* Bit zero is set */
+
+			/* First tail page only */
 			unsigned char compound_dtor;
 			unsigned char compound_order;
 			atomic_t compound_mapcount;
-			unsigned int compound_nr;
+			unsigned int compound_nr; /* 1 << compound_order */
 		};
-		struct {
-			unsigned long _compound_pad_1;
+		struct { /* Second tail page of compound page */
+			unsigned long _compound_pad_1; /* compound_head */
 			atomic_t hpage_pinned_refcount;
+			/* For both global and memcg */
 			struct list_head deferred_list;
 		};
-		struct {
-			unsigned long _pt_pad_1;
-			pgtable_t pmd_huge_pte;
-			unsigned long _pt_pad_2;
+		struct { /* Page table pages */
+			unsigned long _pt_pad_1; /* compound_head */
+			pgtable_t pmd_huge_pte; /* protected by page->ptl */
+			unsigned long _pt_pad_2; /* mapping */
 			union {
-				struct mm_struct *pt_mm;
-				atomic_t pt_frag_refcount;
+				struct mm_struct *pt_mm; /* x86 pgds only */
+				atomic_t pt_frag_refcount; /* powerpc */
 #ifdef CONFIG_ARCH_WANT_HUGE_PMD_SHARE
 				atomic_t pt_share_count;
 #endif
@@ -173,30 +177,66 @@ struct page {
 			spinlock_t ptl;
 #endif
 		};
-		struct {
+		struct { /* ZONE_DEVICE pages */
+			/** @pgmap: Points to the hosting device page map. */
 			struct dev_pagemap *pgmap;
 			void *zone_device_data;
+			/*
+			 * ZONE_DEVICE private pages are counted as being
+			 * mapped so the next 3 words hold the mapping, index,
+			 * and private fields from the source anonymous or
+			 * page cache page while the page is migrated to device
+			 * private memory.
+			 * ZONE_DEVICE MEMORY_DEVICE_FS_DAX pages also
+			 * use the mapping, index, and private fields when
+			 * pmem backed DAX files are mapped.
+			 */
 		};
 
+		/** @rcu_head: You can use this to free a page by RCU. */
 		struct rcu_head rcu_head;
 	};
 
-	union {
+	union { /* This union is 4 bytes in size. */
+		/*
+		 * If the page can be mapped to userspace, encodes the number
+		 * of times this page is referenced by a page table.
+		 */
 		atomic_t _mapcount;
+
+		/*
+		 * If the page is neither PageSlab nor mappable to userspace,
+		 * the value stored here may help determine what this page
+		 * is used for.  See page-flags.h for a list of page types
+		 * which are currently stored here.
+		 */
 		unsigned int page_type;
-		unsigned int active;
-		int units;
+
+		unsigned int active; /* SLAB */
+		int units; /* SLOB */
 	};
 
+	/* Usage count. *DO NOT USE DIRECTLY*. See page_ref.h */
 	atomic_t _refcount;
 
 #ifdef CONFIG_MEMCG
 	unsigned long memcg_data;
 #endif
 
+	/*
+	 * On machines where all RAM is mapped into kernel address space,
+	 * we can simply calculate the virtual address. On machines with
+	 * highmem some memory is mapped into kernel virtual memory
+	 * dynamically, so we need a place to store that address.
+	 * Note that this field could be 16 bits on x86 ... ;)
+	 *
+	 * Architectures with slow multiplication can define
+	 * WANT_PAGE_VIRTUAL in asm/page.h
+	 */
 #if defined(WANT_PAGE_VIRTUAL)
-	void *virtual;
-#endif
+	void *virtual; /* Kernel virtual address (NULL if
+					   not kmapped, ie. highmem) */
+#endif /* WANT_PAGE_VIRTUAL */
 
 #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
 	int _last_cpupid;
@@ -213,6 +253,9 @@ static inline atomic_t *compound_pincount_ptr(struct page *page)
 	return &page[2].hpage_pinned_refcount;
 }
 
+/*
+ * Used for sizing the vmemmap region on some architectures
+ */
 #define STRUCT_PAGE_MAX_SHIFT (order_base_2(sizeof(struct page)))
 
 #define PAGE_FRAG_CACHE_MAX_SIZE __ALIGN_MASK(32768, ~PAGE_MASK)
@@ -233,24 +276,34 @@ struct page_frag_cache {
 #else
 	__u32 offset;
 #endif
+	/* we maintain a pagecount bias, so that we dont dirty cache line
+	 * containing page->_refcount every time we allocate a fragment.
+	 */
 	unsigned int pagecnt_bias;
 	bool pfmemalloc;
 };
 
 typedef unsigned long vm_flags_t;
 
+/*
+ * A region containing a mapping of a non-memory backed file under NOMMU
+ * conditions.  These are held in a global tree and are pinned by the VMAs that
+ * map parts of them.
+ */
 struct vm_region {
-	struct rb_node vm_rb;
-	vm_flags_t vm_flags;
-	unsigned long vm_start;
-	unsigned long vm_end;
-	unsigned long vm_top;
-	unsigned long vm_pgoff;
-	struct file *vm_file;
-	struct file *vm_prfile;
+	struct rb_node vm_rb; /* link in global region tree */
+	vm_flags_t vm_flags; /* VMA vm_flags */
+	unsigned long vm_start; /* start address of region */
+	unsigned long vm_end; /* region initialised to here */
+	unsigned long vm_top; /* region allocated to here */
+	unsigned long
+		vm_pgoff; /* the offset in vm_file corresponding to vm_start */
+	struct file *vm_file; /* the backing file or NULL */
+	struct file *vm_prfile; /* the virtual backing file or NULL */
 
-	int vm_usage;
-	bool vm_icache_flushed : 1;
+	int vm_usage; /* region usage count (access under nommu_region_sem) */
+	bool vm_icache_flushed : 1; /* true if the icache has been flushed for
+						* this region */
 };
 
 #ifdef CONFIG_USERFAULTFD
@@ -261,48 +314,112 @@ struct vm_region {
 struct vm_userfaultfd_ctx {
 	struct userfaultfd_ctx *ctx;
 };
-#else
+#else /* CONFIG_USERFAULTFD */
 #define NULL_VM_UFFD_CTX ((struct vm_userfaultfd_ctx){})
 struct vm_userfaultfd_ctx {};
-#endif
+#endif /* CONFIG_USERFAULTFD */
 
+struct extent_page_node {
+	phys_addr_t phys_addr;
+	struct list_head list;
+};
+
+/* * HW2 Part 1: Extent structure containing a linked list of physically 
+ * contiguous pages, number of pages, starting/ending physical address, 
+ * and an extent ID.
+ */
+struct extent_node {
+	unsigned long extent_id; /* Incrementing number */
+	phys_addr_t start_phys; /* Starting physical address */
+	phys_addr_t end_phys; /* Exclusive end physical address */
+	unsigned long nr_pages; /* Number of pages in the list */
+
+	struct list_head
+		page_list; /* Head of the linked list for extent_page_node */
+	struct rb_node rb_node; /* Node for the red-black tree in mm_struct */
+};
+
+struct mm_struct;
+
+/*
+ * CS519 extent helpers implemented in mm/mmap.c
+ */
+void mm_extent_insert_phys(struct mm_struct *mm, phys_addr_t phys);
+void mm_extent_report_and_destroy(struct mm_struct *mm);
+/*
+ * This struct describes a virtual memory area. There is one of these
+ * per VM-area/task. A VM area is any part of the process virtual memory
+ * space that has a special rule for the page-fault handlers (ie a shared
+ * library, the executable area etc).
+ */
 struct vm_area_struct {
-	unsigned long vm_start;
-	unsigned long vm_end;
+	/* The first cache line has the info for VMA tree walking. */
 
+	unsigned long vm_start; /* Our start address within vm_mm. */
+	unsigned long vm_end; /* The first byte after our end address
+					   within vm_mm. */
+
+	/* linked list of VM areas per task, sorted by address */
 	struct vm_area_struct *vm_next, *vm_prev;
 
 	struct rb_node vm_rb;
+
+	/*
+	 * Largest free memory gap in bytes to the left of this VMA.
+	 * Either between this VMA and vma->vm_prev, or between one of the
+	 * VMAs below us in the VMA rbtree and its ->vm_prev. This helps
+	 * get_unmapped_area find a free area of the right size.
+	 */
 	unsigned long rb_subtree_gap;
 
-	struct mm_struct *vm_mm;
+	/* Second cache line starts here. */
 
+	struct mm_struct *vm_mm; /* The address space we belong to. */
+
+	/*
+	 * Access permissions of this VMA.
+	 * See vmf_insert_mixed_prot() for discussion.
+	 */
 	pgprot_t vm_page_prot;
-	unsigned long vm_flags;
+	unsigned long vm_flags; /* Flags, see mm.h. */
 
+	/*
+	 * For areas with an address space and backing store,
+	 * linkage into the address_space->i_mmap interval tree.
+	 */
 	struct {
 		struct rb_node rb;
 		unsigned long rb_subtree_last;
 	} shared;
 
-	struct list_head anon_vma_chain;
-	struct anon_vma *anon_vma;
+	/*
+	 * A file's MAP_PRIVATE vma can be in both i_mmap tree and anon_vma
+	 * list, after a COW of one of the file pages.	A MAP_SHARED vma
+	 * can only be in the i_mmap tree.  An anonymous MAP_PRIVATE, stack
+	 * or brk vma (with NULL file) can only be in an anon_vma list.
+	 */
+	struct list_head anon_vma_chain; /* Serialized by mmap_lock &
+					  * page_table_lock */
+	struct anon_vma *anon_vma; /* Serialized by page_table_lock */
 
+	/* Function pointers to deal with this struct. */
 	const struct vm_operations_struct *vm_ops;
 
-	unsigned long vm_pgoff;
-	struct file *vm_file;
-	struct file *vm_prfile;
-	void *vm_private_data;
+	/* Information about our backing store: */
+	unsigned long vm_pgoff; /* Offset (within vm_file) in PAGE_SIZE
+					   units */
+	struct file *vm_file; /* File we map to (can be NULL). */
+	struct file *vm_prfile; /* shadow of vm_file */
+	void *vm_private_data; /* was vm_pte (shared mem) */
 
 #ifdef CONFIG_SWAP
 	atomic_long_t swap_readahead_info;
 #endif
 #ifndef CONFIG_MMU
-	struct vm_region *vm_region;
+	struct vm_region *vm_region; /* NOMMU mapping region */
 #endif
 #ifdef CONFIG_NUMA
-	struct mempolicy *vm_policy;
+	struct mempolicy *vm_policy; /* NUMA policy for the VMA */
 #endif
 	struct vm_userfaultfd_ctx vm_userfaultfd_ctx;
 } __randomize_layout;
@@ -318,27 +435,12 @@ struct core_state {
 	struct completion startup;
 };
 
-/* CS519 Project 2: Extent Tracking Structures */
-struct extent_page_node {
-	phys_addr_t phys_addr;
-	struct list_head list;
-};
-
-struct extent_node {
-	struct rb_node rb;
-	phys_addr_t start_phys;
-	phys_addr_t end_phys;
-	unsigned int num_pages;
-	unsigned int extent_id;
-	struct list_head page_list;
-};
-/* End CS519 Project 2 */
-
+struct kioctx_table;
 struct mm_struct {
 	struct {
-		struct vm_area_struct *mmap;
+		struct vm_area_struct *mmap; /* list of VMAs */
 		struct rb_root mm_rb;
-		u64 vmacache_seqnum;
+		u64 vmacache_seqnum; /* per-thread vmacache */
 #ifdef CONFIG_MMU
 		unsigned long (*get_unmapped_area)(struct file *filp,
 						   unsigned long addr,
@@ -346,88 +448,166 @@ struct mm_struct {
 						   unsigned long pgoff,
 						   unsigned long flags);
 #endif
-		unsigned long mmap_base;
-		unsigned long mmap_legacy_base;
+		unsigned long mmap_base; /* base of mmap area */
+		unsigned long
+			mmap_legacy_base; /* base of mmap area in bottom-up allocations */
 #ifdef CONFIG_HAVE_ARCH_COMPAT_MMAP_BASES
+		/* Base addresses for compatible mmap() */
 		unsigned long mmap_compat_base;
 		unsigned long mmap_compat_legacy_base;
 #endif
-		unsigned long task_size;
-		unsigned long highest_vm_end;
+		unsigned long task_size; /* size of task vm space */
+		unsigned long highest_vm_end; /* highest vma end address */
 		pgd_t *pgd;
 
 #ifdef CONFIG_MEMBARRIER
+		/**
+		 * @membarrier_state: Flags controlling membarrier behavior.
+		 *
+		 * This field is close to @pgd to hopefully fit in the same
+		 * cache-line, which needs to be touched by switch_mm().
+		 */
 		atomic_t membarrier_state;
 #endif
 
+		/**
+		 * @mm_users: The number of users including userspace.
+		 *
+		 * Use mmget()/mmget_not_zero()/mmput() to modify. When this
+		 * drops to 0 (i.e. when the task exits and there are no other
+		 * temporary reference holders), we also release a reference on
+		 * @mm_count (which may then free the &struct mm_struct if
+		 * @mm_count also drops to 0).
+		 */
 		atomic_t mm_users;
+
+		/**
+		 * @mm_count: The number of references to &struct mm_struct
+		 * (@mm_users count as 1).
+		 *
+		 * Use mmgrab()/mmdrop() to modify. When this drops to 0, the
+		 * &struct mm_struct is freed.
+		 */
 		atomic_t mm_count;
 
 #ifdef CONFIG_MMU
-		atomic_long_t pgtables_bytes;
+		atomic_long_t pgtables_bytes; /* PTE page table pages */
 #endif
-		int map_count;
+		int map_count; /* number of VMAs */
 
-		spinlock_t page_table_lock;
-
+		spinlock_t page_table_lock; /* Protects page tables and some
+					     * counters
+					     */
+		/*
+		 * With some kernel config, the current mmap_lock's offset
+		 * inside 'mm_struct' is at 0x120, which is very optimal, as
+		 * its two hot fields 'count' and 'owner' sit in 2 different
+		 * cachelines,  and when mmap_lock is highly contended, both
+		 * of the 2 fields will be accessed frequently, current layout
+		 * will help to reduce cache bouncing.
+		 *
+		 * So please be careful with adding new fields before
+		 * mmap_lock, which can easily push the 2 fields into one
+		 * cacheline.
+		 */
 		struct rw_semaphore mmap_lock;
 
-		struct list_head mmlist;
+		struct list_head mmlist; /* List of maybe swapped mm's.	These
+					  * are globally strung together off
+					  * init_mm.mmlist, and are protected
+					  * by mmlist_lock
+					  */
 
-		unsigned long hiwater_rss;
-		unsigned long hiwater_vm;
+		unsigned long hiwater_rss; /* High-watermark of RSS usage */
+		unsigned long hiwater_vm; /* High-water virtual memory usage */
 
-		unsigned long total_vm;
-		unsigned long locked_vm;
-		atomic64_t pinned_vm;
-		unsigned long data_vm;
-		unsigned long exec_vm;
-		unsigned long stack_vm;
+		unsigned long total_vm; /* Total pages mapped */
+		unsigned long locked_vm; /* Pages that have PG_mlocked set */
+		atomic64_t pinned_vm; /* Refcount permanently increased */
+		unsigned long data_vm; /* VM_WRITE & ~VM_SHARED & ~VM_STACK */
+		unsigned long exec_vm; /* VM_EXEC & ~VM_WRITE & ~VM_STACK */
+		unsigned long stack_vm; /* VM_STACK */
 		unsigned long def_flags;
 
+		/**
+		 * @write_protect_seq: Locked when any thread is write
+		 * protecting pages mapped by this mm to enforce a later COW,
+		 * for instance during page table copying for fork().
+		 */
 		seqcount_t write_protect_seq;
 
-		spinlock_t arg_lock;
+		spinlock_t arg_lock; /* protect the below fields */
 
 		unsigned long start_code, end_code, start_data, end_data;
 		unsigned long start_brk, brk, start_stack;
 		unsigned long arg_start, arg_end, env_start, env_end;
 
-		unsigned long saved_auxv[AT_VECTOR_SIZE];
+		unsigned long saved_auxv[AT_VECTOR_SIZE]; /* for /proc/PID/auxv */
 
+		/*
+		 * Special counters, in some configurations protected by the
+		 * page_table_lock, in other configurations by being atomic.
+		 */
 		struct mm_rss_stat rss_stat;
 
 		struct linux_binfmt *binfmt;
 
+		/* Architecture-specific MM context */
 		mm_context_t context;
 
-		unsigned long flags;
+		unsigned long flags; /* Must use atomic bitops to access */
 
-		struct core_state *core_state;
+		struct core_state *core_state; /* coredumping support */
 
 #ifdef CONFIG_AIO
 		spinlock_t ioctx_lock;
 		struct kioctx_table __rcu *ioctx_table;
 #endif
 #ifdef CONFIG_MEMCG
+		/*
+		 * "owner" points to a task that is regarded as the canonical
+		 * user/owner of this mm. All of the following must be true in
+		 * order for it to be changed:
+		 *
+		 * current == mm->owner
+		 * current->mm != mm
+		 * new_owner->mm == mm
+		 * new_owner->alloc_lock is held
+		 */
 		struct task_struct __rcu *owner;
 #endif
 		struct user_namespace *user_ns;
 
+		/* store ref to file /proc/<pid>/exe symlink points to */
 		struct file __rcu *exe_file;
 #ifdef CONFIG_MMU_NOTIFIER
 		struct mmu_notifier_subscriptions *notifier_subscriptions;
 #endif
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
-		pgtable_t pmd_huge_pte;
+		pgtable_t pmd_huge_pte; /* protected by page_table_lock */
 #endif
 #ifdef CONFIG_NUMA_BALANCING
+		/*
+		 * numa_next_scan is the next time that the PTEs will be marked
+		 * pte_numa. NUMA hinting faults will gather statistics and
+		 * migrate pages to new nodes if necessary.
+		 */
 		unsigned long numa_next_scan;
+
+		/* Restart point for scanning and setting pte_numa */
 		unsigned long numa_scan_offset;
+
+		/* numa_scan_seq prevents two threads setting pte_numa */
 		int numa_scan_seq;
 #endif
+		/*
+		 * An operation with batched TLB flushing is going on. Anything
+		 * that can move process memory needs to flush the TLB when
+		 * moving a PROT_NONE or PROT_NUMA mapped page.
+		 */
 		atomic_t tlb_flush_pending;
 #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+		/* See flush_tlb_batched_pending() */
 		bool tlb_flush_batched;
 #endif
 		struct uprobes_state uprobes_state;
@@ -439,20 +619,36 @@ struct mm_struct {
 #ifdef CONFIG_IOMMU_SUPPORT
 		u32 pasid;
 #endif
+		/* * -----------------------------------------------------------
+         * CS519 HW2: Per-process Extent tracking fields
+         * -----------------------------------------------------------
+         */
+
+		/* Red-black tree index by starting physical address */
+		struct rb_root extent_tree;
+
+		/* Thread-safe requirement: lock for protecting the rb-tree and lists */
+		spinlock_t extent_lock;
+
+		/* Required output: Total number of extents for printing before exit */
+		unsigned long total_extents;
+
+		/* Counter to generate incrementing extent IDs */
+		unsigned long extent_id_gen;
+
+		/* ----------------------------------------------------------- */
 	} __randomize_layout;
 
-	/* CS519 Project 2: Extent Tracking fields */
-	struct rb_root extent_tree;
-	spinlock_t extent_lock;
-	unsigned int extent_id_counter;
-	unsigned int total_extents_created;
-	/* End CS519 Project 2 */
-
+	/*
+	 * The mm_cpumask needs to be at the end of mm_struct, because it
+	 * is dynamically sized based on nr_cpu_ids.
+	 */
 	unsigned long cpu_bitmap[];
 };
 
 extern struct mm_struct init_mm;
 
+/* Pointer magic because the dynamic array size confuses some compilers. */
 static inline void mm_init_cpumask(struct mm_struct *mm)
 {
 	unsigned long cpu_bitmap = (unsigned long)mm;
@@ -461,6 +657,7 @@ static inline void mm_init_cpumask(struct mm_struct *mm)
 	cpumask_clear((struct cpumask *)cpu_bitmap);
 }
 
+/* Future-safe accessor for struct mm_struct's cpu_vm_mask. */
 static inline cpumask_t *mm_cpumask(struct mm_struct *mm)
 {
 	return (struct cpumask *)&mm->cpu_bitmap;
@@ -479,28 +676,116 @@ static inline void init_tlb_flush_pending(struct mm_struct *mm)
 static inline void inc_tlb_flush_pending(struct mm_struct *mm)
 {
 	atomic_inc(&mm->tlb_flush_pending);
+	/*
+	 * The only time this value is relevant is when there are indeed pages
+	 * to flush. And we'll only flush pages after changing them, which
+	 * requires the PTL.
+	 *
+	 * So the ordering here is:
+	 *
+	 *	atomic_inc(&mm->tlb_flush_pending);
+	 *	spin_lock(&ptl);
+	 *	...
+	 *	set_pte_at();
+	 *	spin_unlock(&ptl);
+	 *
+	 *				spin_lock(&ptl)
+	 *				mm_tlb_flush_pending();
+	 *				....
+	 *				spin_unlock(&ptl);
+	 *
+	 *	flush_tlb_range();
+	 *	atomic_dec(&mm->tlb_flush_pending);
+	 *
+	 * Where the increment if constrained by the PTL unlock, it thus
+	 * ensures that the increment is visible if the PTE modification is
+	 * visible. After all, if there is no PTE modification, nobody cares
+	 * about TLB flushes either.
+	 *
+	 * This very much relies on users (mm_tlb_flush_pending() and
+	 * mm_tlb_flush_nested()) only caring about _specific_ PTEs (and
+	 * therefore specific PTLs), because with SPLIT_PTE_PTLOCKS and RCpc
+	 * locks (PPC) the unlock of one doesn't order against the lock of
+	 * another PTL.
+	 *
+	 * The decrement is ordered by the flush_tlb_range(), such that
+	 * mm_tlb_flush_pending() will not return false unless all flushes have
+	 * completed.
+	 */
 }
 
 static inline void dec_tlb_flush_pending(struct mm_struct *mm)
 {
+	/*
+	 * See inc_tlb_flush_pending().
+	 *
+	 * This cannot be smp_mb__before_atomic() because smp_mb() simply does
+	 * not order against TLB invalidate completion, which is what we need.
+	 *
+	 * Therefore we must rely on tlb_flush_*() to guarantee order.
+	 */
 	atomic_dec(&mm->tlb_flush_pending);
 }
 
 static inline bool mm_tlb_flush_pending(struct mm_struct *mm)
 {
+	/*
+	 * Must be called after having acquired the PTL; orders against that
+	 * PTLs release and therefore ensures that if we observe the modified
+	 * PTE we must also observe the increment from inc_tlb_flush_pending().
+	 *
+	 * That is, it only guarantees to return true if there is a flush
+	 * pending for _this_ PTL.
+	 */
 	return atomic_read(&mm->tlb_flush_pending);
 }
 
 static inline bool mm_tlb_flush_nested(struct mm_struct *mm)
 {
+	/*
+	 * Similar to mm_tlb_flush_pending(), we must have acquired the PTL
+	 * for which there is a TLB flush pending in order to guarantee
+	 * we've seen both that PTE modification and the increment.
+	 *
+	 * (no requirement on actually still holding the PTL, that is irrelevant)
+	 */
 	return atomic_read(&mm->tlb_flush_pending) > 1;
 }
 
+struct vm_fault;
+
 /**
  * typedef vm_fault_t - Return type for page fault handlers.
+ *
+ * Page fault handlers return a bitmask of %VM_FAULT values.
  */
 typedef __bitwise unsigned int vm_fault_t;
 
+/**
+ * enum vm_fault_reason - Page fault handlers return a bitmask of
+ * these values to tell the core VM what happened when handling the
+ * fault. Used to decide whether a process gets delivered SIGBUS or
+ * just gets major/minor fault counters bumped up.
+ *
+ * @VM_FAULT_OOM:		Out Of Memory
+ * @VM_FAULT_SIGBUS:		Bad access
+ * @VM_FAULT_MAJOR:		Page read from storage
+ * @VM_FAULT_WRITE:		Special case for get_user_pages
+ * @VM_FAULT_HWPOISON:		Hit poisoned small page
+ * @VM_FAULT_HWPOISON_LARGE:	Hit poisoned large page. Index encoded
+ *				in upper bits
+ * @VM_FAULT_SIGSEGV:		segmentation fault
+ * @VM_FAULT_NOPAGE:		->fault installed the pte, not return page
+ * @VM_FAULT_LOCKED:		->fault locked the returned page
+ * @VM_FAULT_RETRY:		->fault blocked, must retry
+ * @VM_FAULT_FALLBACK:		huge page fault failed, fall back to small
+ * @VM_FAULT_DONE_COW:		->fault has fully handled COW
+ * @VM_FAULT_NEEDDSYNC:		->fault did not modify page tables and needs
+ *				fsync() to complete (for synchronous page faults
+ *				in DAX)
+ * @VM_FAULT_HINDEX_MASK:	mask HINDEX value
+ *
+ */
 enum vm_fault_reason {
 	VM_FAULT_OOM = (__force vm_fault_t)0x000001,
 	VM_FAULT_SIGBUS = (__force vm_fault_t)0x000002,
@@ -518,6 +803,7 @@ enum vm_fault_reason {
 	VM_FAULT_HINDEX_MASK = (__force vm_fault_t)0x0f0000,
 };
 
+/* Encode hstate index for a hwpoisoned large page */
 #define VM_FAULT_SET_HINDEX(x) ((__force vm_fault_t)((x) << 16))
 #define VM_FAULT_GET_HINDEX(x) (((__force unsigned int)(x) >> 16) & 0xf)
 
@@ -538,10 +824,23 @@ enum vm_fault_reason {
 		{ VM_FAULT_NEEDDSYNC, "NEEDDSYNC" }
 
 struct vm_special_mapping {
-	const char *name;
+	const char *name; /* The name, e.g. "[vdso]". */
+
+	/*
+	 * If .fault is not provided, this points to a
+	 * NULL-terminated array of pages that back the special mapping.
+	 *
+	 * This must not be NULL unless .fault is provided.
+	 */
 	struct page **pages;
+
+	/*
+	 * If non-NULL, then this is called to resolve page faults
+	 * on the special mapping.  If used, .pages is not checked.
+	 */
 	vm_fault_t (*fault)(const struct vm_special_mapping *sm,
 			    struct vm_area_struct *vma, struct vm_fault *vmf);
+
 	int (*mremap)(const struct vm_special_mapping *sm,
 		      struct vm_area_struct *new_vma);
 };
@@ -555,6 +854,10 @@ enum tlb_flush_reason {
 	NR_TLB_FLUSH_REASONS,
 };
 
+/*
+  * A swap entry has to fit into a "unsigned long", as the entry is hidden
+  * in the "index" field of the swapper address space.
+  */
 typedef struct {
 	unsigned long val;
 } swp_entry_t;
