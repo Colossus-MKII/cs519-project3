@@ -68,8 +68,7 @@ struct mem_cgroup;
 #endif
 
 struct page {
-	unsigned long flags; /* Atomic flags, some possibly
-					 * updated asynchronously */
+	unsigned long flags;
 	/*
 	 * Five words (20/40 bytes) are available in this union.
 	 * WARNING: bit 0 of the first word is used for PageTail(). That
@@ -425,7 +424,7 @@ struct cs519_extent_node {
 
 struct mm_struct {
 	struct {
-		struct vm_area_struct *mmap; /* list of VMAs */
+		struct vm_area_struct *mmap;
 		struct rb_root mm_rb;
 		u64 vmacache_seqnum; /* per-thread vmacache */
 		struct rb_root cs519_extents_root;

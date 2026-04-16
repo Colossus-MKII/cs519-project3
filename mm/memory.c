@@ -4239,12 +4239,12 @@ vm_fault_t finish_fault(struct vm_fault *vmf)
 	update_mmu_tlb(vma, vmf->address, vmf->pte);
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 
-	/* --- CS519 HW2 Hook: Record I/O Cache Page --- */
+	/* CS519 HW2 Hook: Record I/O Cache Page */
 	if (vmf->page) {
 		unsigned long phys_addr = page_to_phys(vmf->page);
 		cs519_record_page(vma->vm_mm, phys_addr);
 	}
-	/* ------------------------------------------- */
+	/* ------------------------------------- */
 	return ret;
 }
 

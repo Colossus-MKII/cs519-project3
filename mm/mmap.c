@@ -1803,7 +1803,7 @@ static unsigned long __mmap_region(struct file *file, unsigned long addr,
 		if (error)
 			goto unmap_and_free_file_vma;
 
-		/* Can addr have changed??
+		/* Can addr have changed?
 		 *
 		 * Answer: Yes, several device drivers can do it in their
 		 *         f_op->mmap method. -DaveM
