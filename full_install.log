@@ -1,0 +1,43 @@
+arch/x86/Makefile:142: CONFIG_X86_X32 enabled but no binutils support
+sh ./arch/x86/boot/install.sh 5.15.198-baseline+ \
+	arch/x86/boot/bzImage System.map "/boot"
+run-parts: executing /etc/kernel/postinst.d/dkms 5.15.198-baseline+ /boot/vmlinuz-5.15.198-baseline+
+ * dkms: running auto installation service for kernel 5.15.198-baseline+
+
+Kernel preparation unnecessary for this kernel. Skipping...
+
+Building module:
+cleaning build area...
+make -j16 KERNELRELEASE=5.15.198-baseline+ -C /lib/modules/5.15.198-baseline+/build M=/var/lib/dkms/emulab-ipod-dkms/3.5.0/build...
+Signing module:
+ - /var/lib/dkms/emulab-ipod-dkms/3.5.0/5.15.198-baseline+/x86_64/module/ipod.ko
+Secure Boot not enabled on this system.
+cleaning build area...
+
+ipod.ko:
+Running module version sanity check.
+ - Original module
+   - No original module exists within this kernel
+ - Installation
+   - Installing to /lib/modules/5.15.198-baseline+/updates/dkms/
+
+depmod...
+   ...done.
+run-parts: executing /etc/kernel/postinst.d/initramfs-tools 5.15.198-baseline+ /boot/vmlinuz-5.15.198-baseline+
+update-initramfs: Generating /boot/initrd.img-5.15.198-baseline+
+run-parts: executing /etc/kernel/postinst.d/xx-update-initrd-links 5.15.198-baseline+ /boot/vmlinuz-5.15.198-baseline+
+I: /boot/initrd.img is now a symlink to initrd.img-5.15.198-baseline+
+run-parts: executing /etc/kernel/postinst.d/zz-shim 5.15.198-baseline+ /boot/vmlinuz-5.15.198-baseline+
+run-parts: executing /etc/kernel/postinst.d/zz-update-grub 5.15.198-baseline+ /boot/vmlinuz-5.15.198-baseline+
+Sourcing file `/etc/default/grub'
+Sourcing file `/etc/default/grub.d/init-select.cfg'
+Generating grub configuration file ...
+Found linux image: /boot/vmlinuz-5.15.198-baseline+
+Found initrd image: /boot/initrd.img-5.15.198-baseline+
+Found linux image: /boot/vmlinuz-5.15.0-168-generic
+Found initrd image: /boot/initrd.img-5.15.0-168-generic
+Warning: os-prober will not be executed to detect other bootable partitions.
+Systems on them will not be added to the GRUB boot configuration.
+Check GRUB_DISABLE_OS_PROBER documentation entry.
+Adding boot menu entry for UEFI Firmware Settings ...
+done
