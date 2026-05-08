@@ -877,8 +877,14 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	schedstat_add(cfs_rq->exec_clock, delta_exec);
 
 	curr->vruntime += calc_delta_fair(delta_exec, curr);
-	update_min_vruntime(cfs_rq);
 
+	/* CS519 Project 3 Part B: Heavily penalize inactive tasks */
+	if (task_of(curr)->cooperative_inactive) {
+		/* Add 50ms penalty to push it to the right of the RB-tree */
+		curr->vruntime += 50000000ULL;
+	}
+
+	update_min_vruntime(cfs_rq);
 	if (entity_is_task(curr)) {
 		struct task_struct *curtask = task_of(curr);
 
@@ -5923,11 +5929,7 @@ static int sched_idle_cpu(int cpu)
  * its vruntime. The relevant information is maintained in the `struct cfs_rq` 
  * and `struct sched_entity`.
  */
-static void enqueue_task_fair(
-	struct rq *rq, struct task_struct *p,
-	int flags) static void enqueue_task_fair(struct rq *rq,
-						 struct task_struct *p,
-						 int flags)
+static void enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct cfs_rq *cfs_rq;
 	struct sched_entity *se = &p->se;

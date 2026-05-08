@@ -777,6 +777,7 @@ struct task_struct {
 #endif
 	int on_rq;
 
+	int cooperative_inactive; // 0 means active, 1 means inactive
 	int prio;
 	int static_prio;
 	int normal_prio;
